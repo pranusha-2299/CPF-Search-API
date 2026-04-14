@@ -51,8 +51,25 @@ def send_token_request_to_tp(payload, tp_url=None):
 
 def get_provenance(organization_id, graph_id):
     d = Document.nodes.get(identifier=f"{organization_id}_{graph_id}")
-
     return d
+
+
+def get_document_by_identifier(identifier):
+    """Look up document by plain identifier (matches Java's flat document lookup)."""
+    return Document.nodes.get(identifier=identifier)
+
+
+def get_org_id_by_document_identifier(identifier):
+    """Resolve the organization that owns a document, by querying the token's originator."""
+    query = """
+            MATCH (token:Token)-[:belongs_to]->(doc:Document)
+            WHERE doc.identifier=$identifier
+            RETURN token.originator_id
+            """
+    results, _ = db.cypher_query(query, {"identifier": identifier})
+    if results:
+        return results[0][0]
+    raise DoesNotExist(f"No token found for document '{identifier}'")
 
 
 def query_db_for_subgraph(
@@ -61,7 +78,7 @@ def query_db_for_subgraph(
     suffix = "domain" if is_domain_specific else "backbone"
 
     d = Document.nodes.get(
-        identifier=f"{organization_id}_{graph_id}_{suffix}", format=requested_format
+        identifier=f"{graph_id}_{suffix}", format=requested_format
     )
 
     if not config.disable_tp:
@@ -74,7 +91,7 @@ def query_db_for_subgraph(
                 "originatorId": token.originator_id,
                 "authorityId": token.authority_id,
                 "tokenTimestamp": token.token_timestamp,
-                "documentCreationTimestamp": token.message_timestamp,
+                "messageTimestamp": token.message_timestamp,
                 "documentDigest": token.hash,
                 "additionalData": token.additional_data,
             },
@@ -113,13 +130,11 @@ def get_token_to_store_into_db(token, document_id=None, neo_document=None):
     t.originator_id = token["data"]["originatorId"]
     t.authority_id = token["data"]["authorityId"]
     t.token_timestamp = token["data"]["tokenTimestamp"]
-    t.message_timestamp = token["data"]["documentCreationTimestamp"]
+    t.message_timestamp = token["data"]["messageTimestamp"]
     t.additional_data = token["data"]["additionalData"]
 
     if neo_document is None:
-        neo_document = Document.nodes.get(
-            identifier=f"{token['data']['originatorId']}_{document_id}"
-        )
+        neo_document = Document.nodes.get(identifier=document_id)
 
     trusted_party = TrustedParty.nodes.get(identifier=token["data"]["authorityId"])
 
@@ -137,7 +152,7 @@ def store_token_into_db(token, neo_document, trusted_party):
 def get_b64_encoded_subgraph(
         organization_id, graph_id, is_domain_specific=True, format="rdf"
 ):
-    d = Document.nodes.get(identifier=f"{organization_id}_{graph_id}")
+    d = Document.nodes.get(identifier=graph_id)
     prov_subgraph = retrieve_subgraph(b64decode(d.graph), d.format, is_domain_specific)
     subgraph = prov_subgraph.serialize(format=format).encode("utf-8")
 
@@ -183,7 +198,7 @@ def get_token(organization_id, graph_id, document):
         "originatorId": t.originator_id,
         "authorityId": t.authority_id,
         "tokenTimestamp": t.token_timestamp,
-        "documentCreationTimestamp": t.message_timestamp,
+        "messageTimestamp": t.message_timestamp,
         "documentDigest": t.hash,
         "additionalData": t.additional_data,
     }
@@ -341,5 +356,69 @@ def get_tp_url_by_organization(organization_id):
 
         trusted_parties = list(org.trusts.all())
         return trusted_parties[0].url
+    except DoesNotExist:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# New functions to match Java API
+# ---------------------------------------------------------------------------
+
+def get_token_by_document_identifier(identifier, document):
+    """Get token for a document using plain identifier (no composite key).
+    Matches Java: TokenService.getByDocumentIdentifier"""
+    query = """
+            MATCH (token:Token)-[:belongs_to]->(doc:Document)
+            WHERE doc.identifier=$identifier
+            RETURN token
+            """
+    results, _ = db.cypher_query(
+        query, {"identifier": identifier}, resolve_objects=True
+    )
+
+    if len(results) > 0:
+        t = results[0][0]
+    else:
+        tp_url = get_tp_url_by_organization(
+            get_org_id_by_document_identifier(identifier)
+        )
+        token = send_token_request_to_tp({"graph": document.graph}, tp_url)
+        (token, neo_document, trusted_party) = get_token_to_store_into_db(token, None, document)
+        with db.transaction:
+            t = store_token_into_db(token, neo_document, trusted_party)
+
+    token_data = {
+        "originatorId": t.originator_id,
+        "authorityId": t.authority_id,
+        "tokenTimestamp": t.token_timestamp,
+        "messageTimestamp": t.message_timestamp,
+        "documentDigest": t.hash,
+        "additionalData": t.additional_data,
+    }
+    return {"data": token_data, "signature": t.signature}
+
+
+def get_all_organizations():
+    """List all organizations. Matches Java: OrganizationController.getAllOrganizations"""
+    orgs = Organization.nodes.all()
+    return [
+        {
+            "identifier": org.identifier,
+            "clientCertificate": org.client_cert,
+            "intermediateCertificates": org.intermediate_certs,
+        }
+        for org in orgs
+    ]
+
+
+def get_organization_detail(identifier):
+    """Get single org by identifier. Matches Java: OrganizationController.getOrganizationByIdentifier"""
+    try:
+        org = Organization.nodes.get(identifier=identifier)
+        return {
+            "identifier": org.identifier,
+            "clientCertificate": org.client_cert,
+            "intermediateCertificates": org.intermediate_certs,
+        }
     except DoesNotExist:
         return None

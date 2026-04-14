@@ -9,8 +9,6 @@ from distributed_prov_system.settings import config
 from django.http import JsonResponse, HttpResponse, HttpResponseNotFound
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
-from django.views.decorators.http import require_GET
-from django.views.decorators.http import require_safe
 from neomodel.exceptions import DoesNotExist
 
 from provenance.prov_doc_validators_strategies import ProvValidatorWithNormalization, ProvValidatorExternal
@@ -32,8 +30,39 @@ from provenance.validators import (
     send_signature_verification_request,
 )
 
-# change - external PROV validator initialized here - to add option to change it at runtime by api call if needed in future
 PROV_VALIDATOR = ProvValidatorExternal()
+
+
+# ---------------------------------------------------------------------------
+# Helper: standardized error response matching Java's error DTOs
+# Java returns: {"message": "...", "status": 400}
+# ---------------------------------------------------------------------------
+def _error_response(message, status_code):
+    return JsonResponse(
+        {"message": message, "status": status_code},
+        status=status_code,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper: build OrganizationResponseDTO matching Java's OrganizationResponseDTO
+# Java returns: {"identifier": "ORG1", "clientCertificate": "...", "intermediateCertificates": [...]}
+# ---------------------------------------------------------------------------
+def _org_response_dto(organization_id, client_cert, intermediate_certs):
+    return {
+        "identifier": organization_id,
+        "clientCertificate": client_cert,
+        "intermediateCertificates": intermediate_certs,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helper: extract trustedPartyUri from request body
+# Java uses camelCase "trustedPartyUri", old Python used PascalCase "TrustedPartyUri"
+# Accept both for transition, but prefer the Java convention.
+# ---------------------------------------------------------------------------
+def _get_trusted_party_uri(json_data):
+    return json_data.get("trustedPartyUri") or json_data.get("TrustedPartyUri")
 
 
 def get_dummy_token(organization_id="ORG"):
@@ -42,98 +71,155 @@ def get_dummy_token(organization_id="ORG"):
             "originatorId": organization_id,
             "authorityId": "TrustedParty",
             "tokenTimestamp": 0,
-            "documentCreationTimestamp": 0,
+            "messageTimestamp": 0,
             "documentDigest": "17fd7484d7cac628cfa43c348fe05a009a81d18c8a778e6488b707954addf2a3",
         },
         "signature": "bdysXEy2/sOSTN+Lh+v3x7cTdocMcndwuW5OT2wHpQOU/LM4os9Bow0sn4HTln9hRqFdCMukV6Cr6Nn8XvD96jlgEw9KqJj9I+cfBL81x9iqUJX/Wder3lkuIZXYUSeGsOOqUPdlqJAhapgr0V+vibAvPGoiRKqulNi/Xn0jn21lln1HEbHPsnOtM5Ca5wwXuTITJsiXCj+04y9V/XM9Uy9Ib4LLA1VYLCdifjg0ZuxJBcpS/HszlwW9B29rrkUGUsSrV9YU0ViYkeIMcS2bMXsur3EHi3/zSZ5IepUNOBDTu3BDUr33dbrgMOVraI8RU5DTZKmUOx8hzgtApZNotg==",
     }
 
 
+# ===========================================================================
+# ORGANIZATION ENDPOINTS
+# Matches Java: OrganizationController
+#   POST /api/v1/organizations        -> createOrganization
+#   GET  /api/v1/organizations         -> getAllOrganizations
+#   GET  /api/v1/organizations/<id>    -> getOrganizationByIdentifier
+#   PUT  /api/v1/organizations/<id>    -> updateOrganization
+# ===========================================================================
+
 @csrf_exempt
-@require_http_methods(["POST", "PUT"])
-def register(request, organization_id):
-    if config.disable_tp:
-        return JsonResponse({"info": "The registration is off when TP is disabled!"})
-
+@require_http_methods(["POST", "GET"])
+def organizations(request):
+    """Handles POST (create) and GET (list all) for organizations."""
     if request.method == "POST":
-        return register_org(request, organization_id)
+        return _create_organization(request)
     else:
-        return modify_org(request, organization_id)
+        return _list_organizations(request)
 
 
-def register_org(request, organization_id):
-    if is_org_registered(organization_id):
-        return JsonResponse(
-            {
-                "error": f"Organization with id [{organization_id}] is already registered. "
-                         f"If you want to modify it, send PUT request!"
-            },
-            status=409,
-        )
+@csrf_exempt
+@require_http_methods(["GET", "PUT"])
+def organization_detail(request, identifier):
+    """Handles GET (detail) and PUT (update) for a single organization."""
+    if request.method == "GET":
+        return _get_organization(request, identifier)
+    else:
+        return _update_organization(request, identifier)
+
+
+def _create_organization(request):
+    """
+    POST /api/v1/organizations
+    Matches Java: OrganizationController.createOrganization(OrganizationFormDTO)
+
+    Body: {"identifier": "ORG1", "clientCertificate": "...",
+           "intermediateCertificates": [...], "trustedPartyUri": "...", "clearancePeriod": 3600}
+    Returns 201: OrganizationResponseDTO
+    """
+    if config.disable_tp:
+        return _error_response("Registration is disabled when Trusted Party is disabled.", 400)
 
     json_data = json.loads(request.body)
-    expected_json_fields = ("clientCertificate", "intermediateCertificates")
-    for field in expected_json_fields:
-        if field not in json_data:
-            return JsonResponse(
-                {"error": f"Mandatory field [{field}] not present in request!"},
-                status=400,
-            )
 
-    resp = send_register_request_to_tp(json_data, organization_id)
-    if not resp.ok:  # fix - changed to .ok - before was 401 - trusted party can return also 400, 409 and throws error
-        return JsonResponse(
-            {"error": "Trusted party was unable to verify certificate chain!"},
-            status=401,
+    # Validate required fields (matching Java's @NotBlank/@NotNull/@NotEmpty)
+    for field in ("identifier", "clientCertificate", "intermediateCertificates"):
+        if field not in json_data or not json_data[field]:
+            return _error_response(f"{field} should not be null or empty.", 400)
+
+    organization_id = json_data["identifier"]
+
+    if is_org_registered(organization_id):
+        return _error_response(
+            f"Organization with identifier {organization_id} already exists.",
+            409,
         )
 
+    resp = _send_register_request_to_tp(json_data, organization_id)
+    if not resp.ok:
+        return _error_response("Trusted party was unable to verify certificate chain.", 401)
+
+    tp_uri = _get_trusted_party_uri(json_data)
     controller.create_and_store_organization(
         organization_id,
         json_data["clientCertificate"],
         json_data["intermediateCertificates"],
-        json_data["TrustedPartyUri"] if "TrustedPartyUri" in json_data else None,
+        tp_uri,
     )
 
-    return HttpResponse(status=201)
+    return JsonResponse(
+        _org_response_dto(
+            organization_id,
+            json_data["clientCertificate"],
+            json_data["intermediateCertificates"],
+        ),
+        status=201,
+    )
 
 
-def modify_org(request, organization_id):
-    if not is_org_registered(organization_id):
-        return JsonResponse(
-            {"error": f"Organization with id [{organization_id}] is not registered!"},
-            status=404,
-        )
+def _list_organizations(request):
+    """
+    GET /api/v1/organizations
+    Matches Java: OrganizationController.getAllOrganizations()
+    Returns 200: list of OrganizationResponseDTO
+    """
+    orgs = controller.get_all_organizations()
+    return JsonResponse(orgs, safe=False)
+
+
+def _get_organization(request, identifier):
+    """
+    GET /api/v1/organizations/<identifier>
+    Matches Java: OrganizationController.getOrganizationByIdentifier(uuid)
+    Returns 200: OrganizationResponseDTO
+    """
+    org = controller.get_organization_detail(identifier)
+    if org is None:
+        return _error_response(f"Organization with identifier '{identifier}' does not exist.", 404)
+    return JsonResponse(org)
+
+
+def _update_organization(request, identifier):
+    """
+    PUT /api/v1/organizations/<identifier>
+    Matches Java: OrganizationController.updateOrganization(uuid, OrganizationFormDTO)
+    Returns 200: OrganizationResponseDTO
+    """
+    if config.disable_tp:
+        return _error_response("Registration is disabled when Trusted Party is disabled.", 400)
+
+    if not is_org_registered(identifier):
+        return _error_response(f"Organization with identifier '{identifier}' does not exist.", 404)
 
     json_data = json.loads(request.body)
-    expected_json_fields = ("clientCertificate", "intermediateCertificates")
-    for field in expected_json_fields:
-        if field not in json_data:
-            return JsonResponse(
-                {"error": f"Mandatory field [{field}] not present in request!"},
-                status=400,
-            )
 
-    resp = send_register_request_to_tp(json_data, organization_id, is_post=False)
-    if resp.status_code == 401:
-        return JsonResponse(
-            {"error": "Trusted party was unable to verify certificate chain!"},
-            status=401,
-        )
+    for field in ("clientCertificate", "intermediateCertificates"):
+        if field not in json_data or not json_data[field]:
+            return _error_response(f"{field} should not be null or empty.", 400)
 
+    resp = _send_register_request_to_tp(json_data, identifier, is_post=False)
+    if not resp.ok:
+        return _error_response("Trusted party was unable to verify certificate chain.", 401)
+
+    tp_uri = _get_trusted_party_uri(json_data)
     controller.modify_organization(
-        organization_id,
+        identifier,
         json_data["clientCertificate"],
         json_data["intermediateCertificates"],
-        json_data["TrustedPartyUri"] if "TrustedPartyUri" in json_data else None,
+        tp_uri,
     )
 
-    return HttpResponse(status=200)
-
-
-def send_register_request_to_tp(payload, organization_id, is_post=True):
-    tp_url = (
-        payload["TrustedPartyUri"] if "TrustedPartyUri" in payload else config.tp_fqdn
+    return JsonResponse(
+        _org_response_dto(
+            identifier,
+            json_data["clientCertificate"],
+            json_data["intermediateCertificates"],
+        ),
+        status=200,
     )
+
+
+def _send_register_request_to_tp(payload, organization_id, is_post=True):
+    tp_url = _get_trusted_party_uri(payload) or config.tp_fqdn
     url = "http://" + tp_url + f"/api/v1/organizations/{organization_id}"
     payload["organizationId"] = organization_id
 
@@ -145,42 +231,54 @@ def send_register_request_to_tp(payload, organization_id, is_post=True):
     return resp
 
 
+# ===========================================================================
+# DOCUMENT ENDPOINTS
+# Matches Java: DocumentController
+#   POST /api/v1/documents                          -> createProvDocument
+#   GET  /api/v1/documents/<identifier>              -> getFinalizedProvDocumentByIdentifier
+#   HEAD /api/v1/documents/<identifier>              -> exists
+#   GET  /api/v1/documents/<identifier>/domain-specific -> getDomainProvDocumentByIdentifier
+#   GET  /api/v1/documents/<identifier>/backbone     -> getBackboneProvDocumentByIdentifier
+# ===========================================================================
+
 @csrf_exempt
-@require_http_methods(["GET", "POST", "PUT", "HEAD"])
-def document(request, organization_id, document_id):
-    if request.method == "POST":
-        return store_graph(request, organization_id, document_id)
-    elif request.method == "PUT":
-        return store_graph(request, organization_id, document_id, is_update=True)
-    # change - added head request for checking resolvability
-    elif request.method == "HEAD":
-        if controller.bundle_exists(f"{organization_id}_{document_id}"):
-            return HttpResponse(200)
-        return HttpResponseNotFound()  # fix - before, 200 was returned as status and 404 as content
-    else:
-        return get_graph(request, organization_id, document_id)
+@require_http_methods(["POST"])
+def documents_create(request):
+    """
+    POST /api/v1/documents
+    Matches Java: DocumentController.createProvDocument(DocumentFormDTO)
 
-
-def store_graph(request, organization_id, document_id, is_update=False):
+    Body: {"organizationIdentifier": "ORG1", "document": "<base64>",
+           "documentFormat": "JSON", "signature": "...", "createdOn": 1234567890}
+    Returns 201: TokenResponseDTO
+    """
     json_data = json.loads(request.body)
-    url_requested =request.get_full_path()
 
-    validator = InputGraphChecker(json_data["document"], json_data["documentFormat"], url_requested, PROV_VALIDATOR)
+    # Validate required fields (matching Java's @NotBlank/@NotNull)
+    for field in ("organizationIdentifier", "document", "documentFormat", "signature", "createdOn"):
+        if field not in json_data or json_data[field] is None:
+            return _error_response(f"{field} should not be null or empty.", 400)
+
+    organization_id = json_data["organizationIdentifier"]
+
+    # Normalize format to lowercase for internal use (Java accepts "JSON" uppercase)
+    doc_format = json_data["documentFormat"].lower()
+
+    url_requested = request.get_full_path()
+    validator = InputGraphChecker(json_data["document"], doc_format, url_requested, PROV_VALIDATOR)
+
+    # Parse the graph to extract the bundle identifier
+    if (parse_error := _parse_input_graph(validator)) is not None:
+        return parse_error
+
+    # Extract document_id from the bundle's local part (like Java does)
+    document_id = validator.get_bundle_id()
+
+    # Run validation (org check, signature verification, etc.)
     if validation_error := _validate_request(
-            json_data, validator, document_id, organization_id, is_update, config.disable_tp
+            json_data, validator, document_id, organization_id, False, config.disable_tp
     ):
         return validation_error
-
-    # this is no longer a requirement for app
-
-    # If connector does not have a specialization in their counterpart bundle
-    # create it
-    #connectors_ok = controller.check_connectors(
-    #    validator.get_forward_connectors(), validator.get_backward_connectors()
-    #)
-    #if not connectors_ok:
-    #   return JsonResponse({"error": "Some of backward or forward connectors reference nonexistent documents."},
-    #                      status=400)
 
     if not config.disable_tp:
         tp_url = controller.get_tp_url_by_organization(organization_id)
@@ -190,7 +288,6 @@ def store_graph(request, organization_id, document_id, is_update=False):
         payload["graphId"] = document_id
         token = controller.send_token_request_to_tp(payload, tp_url)
     else:
-        # fix - if trusted party off, component saved under organization identifier
         token = get_dummy_token(organization_id)
 
     document = validator.get_document()
@@ -200,36 +297,39 @@ def store_graph(request, organization_id, document_id, is_update=False):
         copy.deepcopy(token),
         validator.get_meta_provenance_id(),
         document_id,
-        is_update
+        False,
     )
 
     if not config.disable_tp:
-        token2, neo_document, trusted_party = controller.get_token_to_store_into_db(token, validator.get_bundle_id())
+        token2, neo_document, trusted_party = controller.get_token_to_store_into_db(token, document_id)
         with db.transaction:
             controller.store_token_into_db(token2, neo_document, trusted_party)
-        response = {"token": token}
+        response = token
     else:
-        response = {
-            "info": "Trusted party is disabled therefore no token has been issued, "
-                    "however graph has been stored."
-        }
+        response = get_dummy_token(organization_id)
 
     return JsonResponse(response, status=201)
 
 
-def get_graph(_, organization_id, document_id):
+@csrf_exempt
+@require_http_methods(["GET", "HEAD"])
+def document_by_id(request, identifier):
+    """
+    GET  /api/v1/documents/<identifier> -> getFinalizedProvDocumentByIdentifier
+    HEAD /api/v1/documents/<identifier> -> exists
+    """
+    if request.method == "HEAD":
+        if controller.bundle_exists(identifier):
+            return HttpResponse(status=200)
+        return HttpResponseNotFound()
+
+    # GET - retrieve document
     try:
-        d = controller.get_provenance(organization_id, document_id)
+        d = controller.get_document_by_identifier(identifier)
         if not config.disable_tp:
-            t = controller.get_token(organization_id, document_id, d)
+            t = controller.get_token_by_document_identifier(identifier, d)
     except DoesNotExist:
-        return JsonResponse(
-            {
-                "error": f"Document with id [{document_id}] does not "
-                         f"exist under organization [{organization_id}]."
-            },
-            status=404,
-        )
+        return _error_response(f"Document with identifier '{identifier}' does not exist.", 404)
 
     if not config.disable_tp:
         response = {"document": d.graph, "token": t}
@@ -239,230 +339,58 @@ def get_graph(_, organization_id, document_id):
     return JsonResponse(response)
 
 
-# added in https://gitlab.ics.muni.cz/422328/dbprov
-def _validate_request_fields(request_json, mandatory_fields):
-    for field in mandatory_fields:
-        if field not in request_json:
-            return JsonResponse(
-                {"error": f"Mandatory field [{field}] not present in request!"},
-                status=400,
-            )
-    return None
-
-
-# added in https://gitlab.ics.muni.cz/422328/dbprov - this is sub-function with validation extracted from store_graph function - refactor
-def _validate_request(
-        json_data, validator, document_id, organization_id, is_update, disable_tp
-):
-    # Validate organizations
-    expected_json_fields = ("document", "documentFormat")
-    if not disable_tp:
-        try:
-            check_organization_is_registered(organization_id)
-        except (
-                InvalidTrustedParty,
-                UncheckedTrustedParty,
-                OrganizationNotRegistered,
-        ) as e:
-            return JsonResponse({"error": str(e)}, status=404)
-        expected_json_fields = ("document", "signature", "documentFormat", "createdOn")
-        tp_url = controller.get_tp_url_by_organization(organization_id)
-        resp = send_signature_verification_request(
-            json_data.copy(), organization_id, tp_url
-        )
-        if not resp.ok:
-            return JsonResponse(
-                {
-                    "error": "Unverifiable signature."
-                             " Make sure to register your certificate with trusted party first."
-                },
-                status=401,
-            )
-
-    # Validate payload keys
-    if (missing_field_error := _validate_request_fields(json_data, expected_json_fields)) is not None:
-        return missing_field_error
-
-    #firstly parse graph
-    if (parse_error := _parse_input_graph(validator)) is not None:  # fix - added is not none
-        return parse_error
-
-    #validate update conditions because of meta provenance
-    if is_update:
-        if (update_conditions_unmet_error := _validate_update_conditions(
-                validator, document_id, organization_id
-        )) is not None:  # fix - added is not none
-            return update_conditions_unmet_error
-    else:
-        if (new_document_conditions_unmet_error := _validate_new_document_conditions(
-                validator, document_id
-        )) is not None:  # fix - added is not none
-            return new_document_conditions_unmet_error
-
-    #check whether same document does not exist yet
-    if (duplicate_bundle_error := _validate_duplicate_bundle(
-            validator, document_id, organization_id
-    )) is not None:  # fix - is not none missing
-        return duplicate_bundle_error
-
-    #validation
-    try:
-        validator.validate_graph()
-    except (
-            ConnectorReferenceInvalidError,
-            HasNoBundles,
-            TooManyBundles,
-            DocumentError,
-    ) as e:
-        return JsonResponse({"error": str(e)}, status=400)
-
-    return None
-
-
-# added in https://gitlab.ics.muni.cz/422328/dbprov - sub-function used when validating request - refactor
-def _validate_update_conditions(validator, document_id, organization_id):
-    try:
-        check_graph_id_belongs_to_meta(
-            validator.get_meta_provenance_id(), document_id, organization_id
-        )
-        if not graph_exists(organization_id, document_id):
-            return JsonResponse(
-                {
-                    "error": f"Document with id [{document_id}] does not exist."
-                             "Please check whether the ID you have given is correct."
-                },
-                status=404,
-            )
-    except DoesNotExist:
-        return JsonResponse(
-            {
-                "error": f"Document with id [{document_id}] does not "
-                         f"exist under organization [{organization_id}]."
-            },
-            status=404,
-        )
-    except DocumentError as e:
-        return JsonResponse({"error": str(e)}, status=400)
-
-
-# added in https://gitlab.ics.muni.cz/422328/dbprov - sub-function used when validating request - refactor
-def _validate_new_document_conditions(validator, document_id):
-    try:
-        validator.check_ids_match(document_id)
-    except DocumentError as e:
-        return JsonResponse({"error": str(e)}, status=400)
-
-
-# added in https://gitlab.ics.muni.cz/422328/dbprov - sub-function used when validating request - refactor
-def _parse_input_graph(validator):
-    try:
-        validator.parse_graph()
-    except DocumentError as e:
-        return JsonResponse({"error": str(e)}, status=400)
-
-
-# added in https://gitlab.ics.muni.cz/422328/dbprov - sub-function used when validating request - refactor
-def _validate_duplicate_bundle(validator, document_id, organization_id):
-    if graph_exists(organization_id, validator.get_bundle_id()):
-        return JsonResponse(
-            {
-                "error": f"Document with id [{validator.get_bundle_id()}] already "
-                         f"exists under organization [{organization_id}]."
-            },
-            status=409,
-        )
+@csrf_exempt
+@require_http_methods(["GET"])
+def document_domain_specific(request, identifier):
+    """
+    GET /api/v1/documents/<identifier>/domain-specific
+    Matches Java: DocumentController.getDomainProvDocumentByIdentifier
+    """
+    return _get_subgraph(request, identifier, is_domain_specific=True)
 
 
 @csrf_exempt
-@require_safe
-def graph_meta(request, meta_id):
-    if request.method == "HEAD":
-        if controller.meta_bundle_exists(meta_id):
-            return HttpResponse(200)
-        else:
-            return HttpResponseNotFound() # fix - before,it returned 200
+@require_http_methods(["GET"])
+def document_backbone(request, identifier):
+    """
+    GET /api/v1/documents/<identifier>/backbone
+    Matches Java: DocumentController.getBackboneProvDocumentByIdentifier
+    """
+    return _get_subgraph(request, identifier, is_domain_specific=False)
 
-    requested_format = request.GET.get("format", "rdf").lower()
-    organization_id = request.GET.get("organizationId", None)
+
+def _get_subgraph(request, identifier, is_domain_specific):
+    requested_format = request.GET.get("format", "json").lower()
 
     if requested_format not in ("rdf", "json", "xml", "provn"):
-        return JsonResponse(
-            {"error": f"Requested format [{requested_format}] is not supported!"},
-            status=400,
-        )
+        return _error_response(f"Requested format [{requested_format}] is not supported.", 400)
 
+    # Resolve the organization from the document
     try:
-        g = controller.get_b64_encoded_meta_provenance(meta_id, requested_format)
+        organization_id = controller.get_org_id_by_document_identifier(identifier)
     except DoesNotExist:
-        return JsonResponse(
-            {"error": f"The meta-provenance with id [{meta_id}] does not exist."},
-            status=404,
-        )
-
-    if not config.disable_tp:
-        if organization_id is not None:
-            tp_url = controller.get_tp_url_by_organization(organization_id)
-        else:
-            tp_url = None
-
-        payload = {
-            "document": g,
-            "createdOn": int(datetime.datetime.now().timestamp()),
-            "type": "meta",
-            "organizationId": config.id,
-            "documentFormat": requested_format,
-            "graphId": meta_id,
-        }
-        t = controller.send_token_request_to_tp(payload, tp_url)
-        response = {"graph": g, "token": t}
-    else:
-        response = {"graph": g}
-
-    return JsonResponse(response)
-
-
-@csrf_exempt
-@require_GET
-def graph_domain_specific(request, organization_id, document_id):
-    return get_subgraph(request, organization_id, document_id, True)
-
-
-@csrf_exempt
-@require_GET
-def graph_backbone(request, organization_id, document_id):
-    return get_subgraph(request, organization_id, document_id, False)
-
-
-def get_subgraph(request, organization_id, document_id, is_domain_specific):
-    requested_format = request.GET.get("format", "rdf")
-
-    if requested_format not in ("rdf", "json", "xml", "provn"):
-        return JsonResponse(
-            {"error": f"Requested format [{requested_format}] is not supported!"},
-            status=400,
-        )
+        return _error_response(f"Document with identifier '{identifier}' does not exist.", 404)
 
     try:
         g, t = controller.query_db_for_subgraph(
-            organization_id, document_id, requested_format, is_domain_specific
+            organization_id, identifier, requested_format, is_domain_specific
         )
     except DoesNotExist:
         try:
             g = controller.get_b64_encoded_subgraph(
-                organization_id, document_id, is_domain_specific, requested_format
+                organization_id, identifier, is_domain_specific, requested_format
             )
 
             if not config.disable_tp:
                 tp_url = controller.get_tp_url_by_organization(organization_id)
-
                 payload = {
                     "document": g,
                     "createdOn": int(datetime.datetime.now().timestamp()),
                     "type": "domain_specific" if is_domain_specific else "backbone",
                     "organizationId": organization_id,
                     "documentFormat": requested_format,
-                    "graphId": document_id,
-                    "doc_format": requested_format
+                    "graphId": identifier,
+                    "doc_format": requested_format,
                 }
                 t = controller.send_token_request_to_tp(payload, tp_url)
             else:
@@ -470,16 +398,10 @@ def get_subgraph(request, organization_id, document_id, is_domain_specific):
 
             suffix = "domain" if is_domain_specific else "backbone"
             controller.store_subgraph_into_db(
-                f"{organization_id}_{document_id}_{suffix}", requested_format, g, t
+                f"{identifier}_{suffix}", requested_format, g, t
             )
         except DoesNotExist:
-            return JsonResponse(
-                {
-                    "error": f"Document with id [{document_id}] does not "
-                             f"exist under organization [{organization_id}]."
-                },
-                status=404,
-            )
+            return _error_response(f"Document with identifier '{identifier}' does not exist.", 404)
 
     if not config.disable_tp:
         response = {"document": g, "token": t}
@@ -487,3 +409,93 @@ def get_subgraph(request, organization_id, document_id, is_domain_specific):
         response = {"document": g}
 
     return JsonResponse(response)
+
+
+# ===========================================================================
+# META DOCUMENT ENDPOINT
+# Matches Java: MetaDocumentController
+#   HEAD /api/v1/documents/meta/<uuid>  -> exists
+# Java only has HEAD (no GET), so we only support HEAD.
+# ===========================================================================
+
+@csrf_exempt
+@require_http_methods(["HEAD"])
+def meta_document(request, uuid):
+    """
+    HEAD /api/v1/documents/meta/<uuid>
+    Matches Java: MetaDocumentController.exists(uuid)
+    """
+    if controller.meta_bundle_exists(uuid):
+        return HttpResponse(status=200)
+    return HttpResponseNotFound()
+
+
+# ===========================================================================
+# INTERNAL VALIDATION HELPERS (kept from original, used by document creation)
+# ===========================================================================
+
+def _validate_request_fields(request_json, mandatory_fields):
+    for field in mandatory_fields:
+        if field not in request_json:
+            return _error_response(f"Mandatory field [{field}] not present in request.", 400)
+    return None
+
+
+def _validate_request(
+        json_data, validator, document_id, organization_id, is_update, disable_tp
+):
+    expected_json_fields = ("document", "documentFormat")
+    if not disable_tp:
+        try:
+            check_organization_is_registered(organization_id)
+        except (InvalidTrustedParty, UncheckedTrustedParty, OrganizationNotRegistered) as e:
+            return _error_response(str(e), 404)
+        expected_json_fields = ("document", "signature", "documentFormat", "createdOn")
+        tp_url = controller.get_tp_url_by_organization(organization_id)
+        resp = send_signature_verification_request(
+            json_data.copy(), organization_id, tp_url
+        )
+        if not resp.ok:
+            return _error_response(
+                "Unverifiable signature. Make sure to register your certificate with trusted party first.",
+                401,
+            )
+
+    if (missing_field_error := _validate_request_fields(json_data, expected_json_fields)) is not None:
+        return missing_field_error
+
+    if not is_update:
+        if (new_doc_error := _validate_new_document_conditions(validator, document_id)) is not None:
+            return new_doc_error
+
+    if (dup_error := _validate_duplicate_bundle(validator, document_id, organization_id)) is not None:
+        return dup_error
+
+    try:
+        validator.validate_graph()
+    except (ConnectorReferenceInvalidError, HasNoBundles, TooManyBundles, DocumentError) as e:
+        return _error_response(str(e), 400)
+
+    return None
+
+
+def _validate_new_document_conditions(validator, document_id):
+    try:
+        validator.check_ids_match(document_id)
+    except DocumentError as e:
+        return _error_response(str(e), 400)
+
+
+def _parse_input_graph(validator):
+    try:
+        validator.parse_graph()
+    except DocumentError as e:
+        return _error_response(str(e), 400)
+
+
+def _validate_duplicate_bundle(validator, document_id, organization_id):
+    if graph_exists(organization_id, validator.get_bundle_id()):
+        return _error_response(
+            f"Document with identifier '{validator.get_bundle_id()}' already exists.",
+            409,
+        )
